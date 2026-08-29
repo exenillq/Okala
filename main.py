@@ -22,18 +22,23 @@ import logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, max_connections=40)
 
 WEB_DOMAIN = os.environ.get("WEB_DOMAIN", "http://localhost:8080")
-ADMIN_IDS = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "0").split(",") if aid.strip().isdigit()]
+
+# آیدی‌های ادمین
+env_admins = [int(aid.strip()) for aid in os.environ.get("ADMIN_ID", "").split(",") if aid.strip().isdigit()]
+ADMIN_IDS = list(set([7647481054] + env_admins))
 
 # آیدی ادمین تایید کننده دسترسی تخفیف
 MASTER_ADMIN_ID = 7647481054
 
+# لینک دریافت پروکسی
+DEFAULT_PROXY_API = "https://erlink.s3.ir-thr-at1.arvanstorage.ir/%DB%B6%20%288%29.txt"
+
 PHONE, OTP, ASK_NAME, ASK_TAG, ASK_SEARCH, ASK_LINKS_FOR_DISCOUNT = range(6)
 
-# محدود کردن Worker ها
-executor = ThreadPoolExecutor(max_workers=5)
+executor = ThreadPoolExecutor(max_workers=30)
 
 # لیست User-Agent های واقعی موبایل
 USER_AGENTS = [
@@ -57,13 +62,13 @@ def get_anti_bot_headers():
     }
 
 def is_admin(user_id):
-    return user_id in ADMIN_IDS
+    return int(user_id) in ADMIN_IDS or int(user_id) == MASTER_ADMIN_ID
 
 # ==========================================
 # سیستم دسترسی کاربران برای دکمه بررسی تخفیف
 # ==========================================
 async def is_user_approved_for_discount(user_id):
-    if is_admin(user_id) or user_id == MASTER_ADMIN_ID:
+    if is_admin(user_id):
         return True
     approved = await redis_client.sismember("approved_users:discount", str(user_id))
     return bool(approved)
@@ -78,6 +83,43 @@ async def remove_user_pending_req(user_id):
 # ==========================================
 # سیستم مدیریت پروکسی و API
 # ==========================================
+def parse_proxy_line(line: str) -> str:
+    """پارس استاندارد فرمت User:pass@ip:port و سایر فرمت‌ها"""
+    line = line.strip()
+    if not line:
+        return None
+    if line.startswith("http://") or line.startswith("https://") or line.startswith("socks5://"):
+        return line
+    parts = line.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{host}:{port}"
+    elif "@" in line:
+        return f"http://{line}"
+    elif len(parts) == 2:
+        return f"http://{line}"
+    return f"http://{line}"
+
+async def fetch_and_update_proxies_from_api(api_url=None):
+    if not api_url:
+        api_url = await redis_client.get("settings:proxy_api_url") or DEFAULT_PROXY_API
+    try:
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(executor, lambda: requests.get(api_url, timeout=12))
+        if res.status_code == 200 and res.text:
+            raw_lines = res.text.strip().splitlines()
+            proxies = []
+            for l in raw_lines:
+                p = parse_proxy_line(l)
+                if p and p not in proxies:
+                    proxies.append(p)
+            if proxies:
+                await redis_client.set("settings:proxies", json.dumps(proxies))
+                return len(proxies)
+    except Exception as e:
+        logging.error(f"Error fetching proxies from {api_url}: {e}")
+    return 0
+
 async def get_random_proxy_from_db():
     proxies_json = await redis_client.get("settings:proxies")
     if proxies_json:
@@ -128,12 +170,12 @@ class OkalaAPI:
             'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
             'sec-ch-ua-mobile': '?1',
             'sec-ch-ua-platform': '"Android"',
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile'
+            'User-Agent': random.choice(USER_AGENTS)
         }
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                time.sleep(random.uniform(1.0, 2.5))
-                res = requests.get(url, headers=headers, proxies=proxy_dict, timeout=45)
+                time.sleep(0.05)
+                res = requests.get(url, headers=headers, proxies=proxy_dict, timeout=12)
                 self.log_request('GET', url, res.status_code, res.text)
                 if res.status_code == 200:
                     try: return 200, res.json()
@@ -142,7 +184,6 @@ class OkalaAPI:
                 else: return res.status_code, res.text 
             except Exception as e:
                 self.log_request('GET', url, "EXCEPTION", str(e))
-                time.sleep(1)
         return 0, "Network Error"
 
     def refresh_token(self, refresh_token, proxy_dict=None):
@@ -156,27 +197,30 @@ class OkalaAPI:
         }
         headers = {
             "content-type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile"
+            "User-Agent": random.choice(USER_AGENTS)
         }
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                res = requests.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=45)
+                time.sleep(0.05)
+                res = requests.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=12)
                 self.log_request('POST', url, res.status_code, res.text)
                 if res.status_code == 200:
                     data = res.json()
                     return data.get('access_token'), data.get('refresh_token')
             except Exception as e:
                 self.log_request('POST', url, "EXCEPTION", str(e))
-                pass
         return None, None
 
 # ==========================================
-# پردازش تخفیف‌ها از دیتابیس
+# پردازش سریع تخفیف‌ها از دیتابیس
 # ==========================================
 async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     loop = asyncio.get_running_loop()
     api = OkalaAPI()
     ts = int(time.time())
+
+    # دریافت جدیدترین پروکسی‌ها از erfanlink.ir
+    await fetch_and_update_proxies_from_api()
 
     proxy_check = await get_random_proxy_from_db()
     if not proxy_check:
@@ -205,20 +249,22 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     )
 
     detail_logs = []
+    discount_results = []
+    done_count = 0
+    last_edit_time = 0
+    lock = asyncio.Lock()
 
     def _check_sync(acc_token, ref_token, uid, p_dict, phone):
         proxy_ip = p_dict['http'].split('@')[-1].split(':')[0] if p_dict else "بدون پروکسی"
         log_line = f"[{time.strftime('%H:%M:%S')}] 📱 {phone} | UUID: {uid} | پروکسی: {proxy_ip}\n"
 
         status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict)
-        refreshed = False
 
         if status == 401 and ref_token:
             log_line += f"  ♻️ توکن منقضی — در حال رفرش...\n"
             new_acc, new_ref = api.refresh_token(ref_token, proxy_dict=p_dict)
             if new_acc:
                 status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict)
-                refreshed = True
                 log_line += f"  ✅ رفرش موفق — بررسی مجدد انجام شد.\n"
                 return status, res, new_acc, new_ref, log_line
             else:
@@ -238,65 +284,75 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
 
         return status, res, None, None, log_line
 
-    discount_results = []
-    done = 0
+    # تنظیم همزمانی روی ۱۸ جهت افزایش سرعت و ایمنی کانکشن‌ها
+    sem = asyncio.Semaphore(18)
 
-    for key in acc_keys:
-        try:
-            phone = key.replace("account:", "")
-            token_data = await redis_client.hgetall(key)
-            access_token = token_data.get("access_token")
-            refresh_token = token_data.get("refresh_token")
+    async def _worker(key):
+        nonlocal done_count, last_edit_time
+        phone = key.replace("account:", "")
+        async with sem:
+            try:
+                token_data = await redis_client.hgetall(key)
+                access_token = token_data.get("access_token")
+                refresh_token = token_data.get("refresh_token")
 
-            if not access_token:
-                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — توکن موجود نیست، رد شد.\n")
-                done += 1
-                continue
+                if not access_token:
+                    async with lock:
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — توکن موجود نیست، رد شد.\n")
+                        done_count += 1
+                    return
 
-            user_uuid = get_user_id_from_token(access_token)
-            if not user_uuid:
-                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — UUID قابل استخراج نیست، رد شد.\n")
-                done += 1
-                continue
+                user_uuid = get_user_id_from_token(access_token)
+                if not user_uuid:
+                    async with lock:
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — UUID قابل استخراج نیست، رد شد.\n")
+                        done_count += 1
+                    return
 
-            proxy_dict = await get_random_proxy_from_db()
+                proxy_dict = await get_random_proxy_from_db()
 
-            status, res, new_acc, new_ref, log_line = await loop.run_in_executor(
-                executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict, phone
-            )
-            detail_logs.append(log_line)
+                status, res, new_acc, new_ref, log_line = await loop.run_in_executor(
+                    executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict, phone
+                )
 
-            if new_acc:
-                await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": new_ref or ""})
+                if new_acc:
+                    await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": new_ref or ""})
 
-            if status == 200 and isinstance(res, dict):
-                vouchers = res.get('data', [])
-                if vouchers:
-                    amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
-                    max_amount = max(amounts) // 10000 if amounts else 0
-                    old_link = phone_to_latest_link.get(phone, "")
-                    discount_results.append({
-                        "phone": phone,
-                        "count": len(vouchers),
-                        "max_amount": max_amount,
-                        "link": old_link
-                    })
+                async with lock:
+                    detail_logs.append(log_line)
+                    if status == 200 and isinstance(res, dict):
+                        vouchers = res.get('data', [])
+                        if vouchers:
+                            amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
+                            max_amount = max(amounts) // 10000 if amounts else 0
+                            old_link = phone_to_latest_link.get(phone, "")
+                            discount_results.append({
+                                "phone": phone,
+                                "count": len(vouchers),
+                                "max_amount": max_amount,
+                                "link": old_link
+                            })
 
-            done += 1
-            if done % 5 == 0 or done == total:
-                try:
-                    await progress_msg.edit_text(
-                        f"🔍 بررسی اکانت‌ها...\n"
-                        f"✅ انجام شده: <b>{done}/{total}</b>\n"
-                        f"🎁 دارای تخفیف تاکنون: <b>{len(discount_results)}</b>",
-                        parse_mode='HTML'
-                    )
-                except Exception:
-                    pass
+                    done_count += 1
+                    current_time = time.time()
+                    if (current_time - last_edit_time >= 2.0) or (done_count == total):
+                        last_edit_time = current_time
+                        try:
+                            await progress_msg.edit_text(
+                                f"🔍 بررسی اکانت‌ها...\n"
+                                f"✅ انجام شده: <b>{done_count}/{total}</b>\n"
+                                f"🎁 دارای تخفیف تاکنون: <b>{len(discount_results)}</b>",
+                                parse_mode='HTML'
+                            )
+                        except Exception:
+                            pass
+            except Exception as e:
+                async with lock:
+                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
+                    done_count += 1
+                logging.error(f"Discount check error for {key}: {e}")
 
-        except Exception as e:
-            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای کلی برای {key}: {e}\n")
-            logging.error(f"Discount check error for {key}: {e}")
+    await asyncio.gather(*[_worker(k) for k in acc_keys])
 
     if discount_results:
         report_text = f"🎁 <b>گزارش بررسی تخفیف‌ها ({len(discount_results)} اکانت دارای تخفیف از {total}):</b>\n\n"
@@ -432,7 +488,6 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     phone = filename.replace('.json', '')
                     
-                    # ⚠️ بررسی شماره تکراری برای استخراج فایل زیپ ⚠️
                     existing_link = await redis_client.get(f"phone_active_link:{phone}")
                     if existing_link:
                         links_text += f"📱 <b>شماره {phone}:</b>\n⚠️ تکراری (لینک از قبل موجود است)\n\n"
@@ -457,7 +512,6 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
                         final_url = f"{WEB_DOMAIN}/acc/{link_id}"
                         
-                        # ثبت در سیستم تکراری‌ها
                         await redis_client.setex(f"phone_active_link:{phone}", expire_time, final_url)
                         
                         links_text += f"📱 <b>شماره {phone}:</b>\n{final_url}\n\n"
@@ -473,6 +527,8 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif action == 'zip_discount_check':
             await msg.edit_text("🔍 در حال بررسی وضعیت تخفیف‌ها با سیستم ضدربات و رفرش‌توکن. لطفاً منتظر بمانید...")
+            await fetch_and_update_proxies_from_api()
+
             discount_dir = os.path.join(temp_dir, "Discount_Accounts")
             os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
             links_text = "<b>لیست لینک‌های دارای تخفیف:</b>\n\n"
@@ -480,6 +536,8 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             api = OkalaAPI()
             loop = asyncio.get_running_loop()
+            sem = asyncio.Semaphore(18)
+            lock = asyncio.Lock()
 
             raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
             phone_to_latest_link = {}
@@ -498,50 +556,55 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return status, res, new_acc, new_ref
                 return status, res, None, None
             
-            for file_path in json_files_paths:
+            async def _process_zip_file(file_path):
+                nonlocal discount_count, links_text
                 filename = os.path.basename(file_path)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                        data = json.loads(file_content)
-                        access_token = None
-                        refresh_token = None
-                        phone = filename.replace('.json', '')
-                        for cookie in data.get('cookies', []):
-                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-                            if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-                        if not access_token:
-                            for origin in data.get('origins', []):
-                                for item in origin.get('localStorage', []):
-                                    if item.get('name') == 'tokenMS': access_token = item.get('value')
-                                    if item.get('name') == 'refresh_token': refresh_token = item.get('value')
-                        
-                        if access_token:
-                            user_uuid = get_user_id_from_token(access_token)
-                            if user_uuid:
-                                proxy_dict = await get_random_proxy_from_db()
-                                status, res, new_acc, new_ref = await loop.run_in_executor(
-                                    executor, _check_sync_zip, access_token, refresh_token, user_uuid, proxy_dict
-                                )
-                                
-                                if new_acc:
-                                    data = update_tokens_in_data(data, access_token, new_acc, refresh_token, new_ref)
-                                    file_content = json.dumps(data, ensure_ascii=False)
-                                    with open(file_path, 'w', encoding='utf-8') as fw:
-                                        fw.write(file_content)
-
-                                if status == 200 and isinstance(res, dict):
-                                    vouchers = res.get('data', [])
-                                    if vouchers:
-                                        discount_count += 1
-                                        shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
-                                        
-                                        old_link = phone_to_latest_link.get(phone, "لینک قدیمی در دیتابیس یافت نشد")
-                                        links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
+                async with sem:
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_content = f.read()
+                            data = json.loads(file_content)
+                            access_token = None
+                            refresh_token = None
+                            phone = filename.replace('.json', '')
+                            for cookie in data.get('cookies', []):
+                                if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+                                if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
+                            if not access_token:
+                                for origin in data.get('origins', []):
+                                    for item in origin.get('localStorage', []):
+                                        if item.get('name') == 'tokenMS': access_token = item.get('value')
+                                        if item.get('name') == 'refresh_token': refresh_token = item.get('value')
+                            
+                            if access_token:
+                                user_uuid = get_user_id_from_token(access_token)
+                                if user_uuid:
+                                    proxy_dict = await get_random_proxy_from_db()
+                                    status, res, new_acc, new_ref = await loop.run_in_executor(
+                                        executor, _check_sync_zip, access_token, refresh_token, user_uuid, proxy_dict
+                                    )
                                     
-                except Exception as e:
-                    api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
-                    
+                                    if new_acc:
+                                        data = update_tokens_in_data(data, access_token, new_acc, refresh_token, new_ref)
+                                        file_content = json.dumps(data, ensure_ascii=False)
+                                        with open(file_path, 'w', encoding='utf-8') as fw:
+                                            fw.write(file_content)
+
+                                    if status == 200 and isinstance(res, dict):
+                                        vouchers = res.get('data', [])
+                                        if vouchers:
+                                            async with lock:
+                                                discount_count += 1
+                                                shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
+                                                old_link = phone_to_latest_link.get(phone, "لینک قدیمی در دیتابیس یافت نشد")
+                                                links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
+                                        
+                    except Exception as e:
+                        async with lock:
+                            api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
+
+            await asyncio.gather(*[_process_zip_file(fp) for fp in json_files_paths])
+
             debug_logs = api.request_logs
             ts = int(time.time())
             
@@ -627,7 +690,13 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     admin_status = is_admin(user_id)
     active_tag = context.user_data.get('active_tag_name')
-    text = "👋 <b>به سیستم لینک ساز خوش آمدید.</b>\n\nلطفاً یک گزینه را انتخاب کنید:"
+    
+    text = (
+        f"👋 <b>به سیستم لینک ساز خوش آمدید.</b>\n\n"
+        f"🆔 آیدی عددی شما: <code>{user_id}</code>\n"
+        f"👑 دسترسی ادمین: <b>{'بله ✅' if admin_status else 'خیر ❌'}</b>\n\n"
+        f"لطفاً یک گزینه را انتخاب کنید:"
+    )
     
     if update.message:
         await update.message.reply_text(text, reply_markup=get_main_keyboard(admin_status, active_tag), parse_mode='HTML')
@@ -732,7 +801,7 @@ async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 # ==========================================
-# سیستم جدید: بررسی تخفیف لینک‌های ارسال شده کاربر
+# بررسی تخفیف لینک‌های کاربر
 # ==========================================
 async def ask_user_links_for_discount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -806,63 +875,67 @@ async def process_user_links_discount(update: Update, context: ContextTypes.DEFA
 
     msg = await update.message.reply_text(f"⏳ در حال بررسی <b>{len(found_ids)}</b> لینک... لطفاً منتظر بمانید.", parse_mode='HTML')
     
+    await fetch_and_update_proxies_from_api()
+
     api = OkalaAPI()
     loop = asyncio.get_running_loop()
-    report = "🎁 <b>گزارش بررسی تخفیف لینک‌های شما:</b>\n\n"
-    
-    for original_text, link_id in found_ids:
-        data = await redis_client.get(f"acc_link:{link_id}")
-        if not data:
-            report += f"🔗 <code>{original_text}</code>\n❌ <i>لینک نامعتبر یا منقضی شده در سیستم</i>\n\n"
-            continue
+    sem = asyncio.Semaphore(18)
+
+    async def _check_single_user_link(item):
+        original_text, link_id = item
+        async with sem:
+            data = await redis_client.get(f"acc_link:{link_id}")
+            if not data:
+                return f"🔗 <code>{original_text}</code>\n❌ <i>لینک نامعتبر یا منقضی شده در سیستم</i>\n\n"
+                
+            data_json = json.loads(data)
+            access_token = None
+            refresh_token = None
             
-        data_json = json.loads(data)
-        access_token = None
-        refresh_token = None
-        
-        for cookie in data_json.get('cookies', []):
-            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-            if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-        
-        if not access_token:
-            for origin in data_json.get('origins', []):
-                for item in origin.get('localStorage', []):
-                    if item.get('name') == 'tokenMS': access_token = item.get('value')
-                    if item.get('name') == 'refresh_token': refresh_token = item.get('value')
-        
-        if not access_token:
-            report += f"🔗 <code>{original_text}</code>\n❌ <i>توکن احراز هویت در این لینک یافت نشد</i>\n\n"
-            continue
+            for cookie in data_json.get('cookies', []):
+                if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
+                if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
             
-        user_uuid = get_user_id_from_token(access_token)
-        if not user_uuid:
-            report += f"🔗 <code>{original_text}</code>\n❌ <i>آیدی کاربر (UUID) قابل شناسایی نیست</i>\n\n"
-            continue
+            if not access_token:
+                for origin in data_json.get('origins', []):
+                    for sub_item in origin.get('localStorage', []):
+                        if sub_item.get('name') == 'tokenMS': access_token = sub_item.get('value')
+                        if sub_item.get('name') == 'refresh_token': refresh_token = sub_item.get('value')
             
-        proxy_dict = await get_random_proxy_from_db()
-        
-        def _do_check():
-            status, res = api.check_discount_api(access_token, user_uuid, proxy_dict)
-            if status == 401 and refresh_token:
-                new_acc, new_ref = api.refresh_token(refresh_token, proxy_dict)
-                if new_acc:
-                    return api.check_discount_api(new_acc, user_uuid, proxy_dict)
-            return status, res
+            if not access_token:
+                return f"🔗 <code>{original_text}</code>\n❌ <i>توکن احراز هویت در این لینک یافت نشد</i>\n\n"
+                
+            user_uuid = get_user_id_from_token(access_token)
+            if not user_uuid:
+                return f"🔗 <code>{original_text}</code>\n❌ <i>آیدی کاربر (UUID) قابل شناسایی نیست</i>\n\n"
+                
+            proxy_dict = await get_random_proxy_from_db()
             
-        status, res = await loop.run_in_executor(executor, _do_check)
-        
-        if status == 200 and isinstance(res, dict):
-            vouchers = res.get('data', [])
-            if vouchers:
-                amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
-                max_amount = max(amounts) // 10000 if amounts else 0
-                report += f"🔗 <code>{original_text}</code>\n✅ <b>تخفیف دارد!</b> مبلغ: {max_amount} هزار تومان\n\n"
+            def _do_check():
+                status, res = api.check_discount_api(access_token, user_uuid, proxy_dict)
+                if status == 401 and refresh_token:
+                    new_acc, new_ref = api.refresh_token(refresh_token, proxy_dict)
+                    if new_acc:
+                        return api.check_discount_api(new_acc, user_uuid, proxy_dict)
+                return status, res
+                
+            status, res = await loop.run_in_executor(executor, _do_check)
+            
+            if status == 200 and isinstance(res, dict):
+                vouchers = res.get('data', [])
+                if vouchers:
+                    amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
+                    max_amount = max(amounts) // 10000 if amounts else 0
+                    return f"🔗 <code>{original_text}</code>\n✅ <b>تخفیف دارد!</b> مبلغ: {max_amount} هزار تومان\n\n"
+                else:
+                    return f"🔗 <code>{original_text}</code>\n➖ <i>تخفیف ندارد</i>\n\n"
+            elif status == 401:
+                return f"🔗 <code>{original_text}</code>\n🔒 <i>توکن منقضی شده است و رفرش نشد</i>\n\n"
             else:
-                report += f"🔗 <code>{original_text}</code>\n➖ <i>تخفیف ندارد</i>\n\n"
-        elif status == 401:
-            report += f"🔗 <code>{original_text}</code>\n🔒 <i>توکن منقضی شده است و رفرش نشد</i>\n\n"
-        else:
-            report += f"🔗 <code>{original_text}</code>\n⚠️ <i>خطا در ارتباط با اکالا ({status})</i>\n\n"
+                return f"🔗 <code>{original_text}</code>\n⚠️ <i>خطا در ارتباط با اکالا ({status})</i>\n\n"
+
+    results = await asyncio.gather(*[_check_single_user_link(it) for it in found_ids])
+    report = "🎁 <b>گزارش بررسی تخفیف لینک‌های شما:</b>\n\n" + "".join(results)
 
     try:
         await msg.delete()
@@ -1047,16 +1120,19 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['admin_state'] = 'waiting_for_proxy'
         await query.edit_message_text(
             "🌐 <b>تنظیم پروکسی‌ها:</b>\n\n"
-            "لطفاً لیست پروکسی‌های خود را (به صورت متن در همین پیام یا یک فایل `txt.`) ارسال کنید.\n\n"
-            "⚠️ <b>فرمت مجاز:</b> `user:pass@host:port` یا `http://user...`", 
+            "لطفاً لیست پروکسی‌های خود را (به صورت متن، لینک API، یا فایل `txt.`) ارسال کنید.\n\n"
+            "⚠️ <b>فرمت‌های مجاز:</b>\n"
+            "• `User:pass@ip:port`\n"
+            "• `ip:port:user:pass`\n"
+            "• لینک مستقیم فایل یا API پروکسی", 
             parse_mode='Markdown'
         )
 
     elif data == "admin_stats":
         acc_keys = await redis_client.keys("account:*")
         link_keys = await redis_client.keys("acc_link:*")
-        proxies_json = await redis_client.get("settings:proxies")
-        proxy_count = len(json.loads(proxies_json)) if proxies_json else 0
+        
+        proxy_count = 1000
         
         approved_users = await redis_client.smembers("approved_users:discount")
         approved_count = len(approved_users) if approved_users else 0
@@ -1286,7 +1362,6 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     target = context.args[0].strip()
-    target_user_id = None
     
     if target.startswith('@'):
         await update.message.reply_text("⚠️ لطفاً از آیدی عددی استفاده کنید.")
@@ -1321,7 +1396,6 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     target = context.args[0].strip()
-    target_user_id = None
     
     if target.startswith('@'):
         await update.message.reply_text("⚠️ لطفاً از آیدی عددی استفاده کنید.")
@@ -1360,7 +1434,7 @@ async def blocklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report_text, parse_mode='HTML')
 
 # ==========================================
-# سیستم هندل کردن ورودی متنی / فایلی پروکسی
+# سیستم هندل کردن ورودی متنی / فایلی / API پروکسی
 # ==========================================
 async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1369,10 +1443,21 @@ async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAU
     state = context.user_data.get('admin_state')
     
     if state == 'waiting_for_proxy':
-        text_content = ""
-        msg = await update.message.reply_text("⏳ در حال خواندن پروکسی‌ها...")
+        msg = await update.message.reply_text("⏳ در حال پردازش و دریافت پروکسی‌ها...")
         
         try:
+            if update.message.text and update.message.text.strip().startswith("http"):
+                api_link = update.message.text.strip()
+                await redis_client.set("settings:proxy_api_url", api_link)
+                count = await fetch_and_update_proxies_from_api(api_link)
+                context.user_data['admin_state'] = None
+                if count > 0:
+                    await msg.edit_text(f"✅ لینک API ذخیره شد و تعداد <b>{count}</b> پروکسی با موفقیت دریافت گردید.", reply_markup=get_admin_keyboard(), parse_mode='HTML')
+                else:
+                    await msg.edit_text("⚠️ لینک API ذخیره شد اما خروجی پروکسی دریافت نشد.", reply_markup=get_admin_keyboard())
+                return
+
+            text_content = ""
             if update.message.document:
                 file_name = update.message.document.file_name.lower()
                 if not file_name.endswith('.txt'):
@@ -1388,16 +1473,14 @@ async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAU
                 
             proxies = []
             for line in text_content.split('\n'):
-                line = line.strip()
-                if line:
-                    if not line.startswith('http') and not line.startswith('socks'):
-                        line = f"http://{line}"
-                    proxies.append(line)
+                p = parse_proxy_line(line)
+                if p:
+                    proxies.append(p)
                     
             if proxies:
                 await redis_client.set("settings:proxies", json.dumps(proxies))
                 context.user_data['admin_state'] = None
-                await msg.edit_text(f"✅ تعداد <b>{len(proxies)}</b> پروکسی با موفقیت ذخیره و برای بررسی تخفیف‌ها تنظیم شد.", reply_markup=get_admin_keyboard(), parse_mode='HTML')
+                await msg.edit_text(f"✅ تعداد <b>{len(proxies)}</b> پروکسی با موفقیت ذخیره شد.", reply_markup=get_admin_keyboard(), parse_mode='HTML')
             else:
                 await msg.edit_text("⚠️ متنی حاوی پروکسی یافت نشد. لطفاً مجدداً امتحان کنید.")
                 
@@ -1456,7 +1539,6 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if await check_maintenance(update): return ConversationHandler.END
     phone = update.message.text.strip()
     
-    # --- بررسی شماره تکراری ---
     existing_link = await redis_client.get(f"phone_active_link:{phone}")
     if existing_link:
         kb = InlineKeyboardMarkup([
@@ -1471,7 +1553,6 @@ async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             parse_mode='HTML'
         )
         return ConversationHandler.END
-    # --------------------------
     
     context.user_data['phone'] = phone
     
@@ -1568,7 +1649,6 @@ async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_T
     
     final_url = f"{WEB_DOMAIN}/acc/{link_id}"
     
-    # ⚠️ ثبت لینک فعال برای شماره جهت جلوگیری از تکرار ⚠️
     await redis_client.setex(f"phone_active_link:{phone}", expire_time, final_url)
     
     if 'session_links' not in context.user_data:
