@@ -241,7 +241,6 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             parse_mode='HTML'
         )
 
-    # استخراج لاگ‌ها برای حالت پشتیبان
     raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
     phone_to_latest_link = {}
     for item in raw_logs:
@@ -329,7 +328,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
                 if new_acc:
                     await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": new_ref or ""})
 
-                # بررسی مستقیم لینک فعال از دیتابیس با هر دو فرمت شماره
+                # بررسی مستقیم لینک فعال از دیتابیس
                 active_link = await redis_client.get(f"phone_active_link:{clean_phone}")
                 if not active_link:
                     active_link = await redis_client.get(f"phone_active_link:{phone}")
@@ -705,7 +704,7 @@ def get_admin_keyboard():
     keyboard = [
         [InlineKeyboardButton("📊 آمار پایگاه داده", callback_data="admin_stats"), InlineKeyboardButton("⏳ تنظیم انقضا", callback_data="admin_expire")],
         [InlineKeyboardButton("📋 گزارش لینک‌های کاربران", callback_data="admin_users_report")],
-        [InlineKeyboardButton("🎁 بررسی تخفیف‌ها", callback_data="admin_check_discounts")],
+        [InlineKeyboardButton("🎁 بررسی تخفیف‌ها", callback_data="admin_check_discounts"), InlineKeyboardButton("📂 تفکیک فایل تخفیف", callback_data="admin_split_discounts")],
         [InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("🔍 بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
         [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی", callback_data="admin_clear")],
         [InlineKeyboardButton("🔗 استخراج لینک‌ها", callback_data="admin_export_links"), InlineKeyboardButton("🔑 استخراج دسترسی‌ها", callback_data="admin_export_tokens")],
@@ -1148,8 +1147,19 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if data == "admin_panel":
+        context.user_data['admin_state'] = None
         context.user_data['admin_zip_action'] = None
         await query.edit_message_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
+        
+    elif data == "admin_split_discounts":
+        context.user_data['admin_state'] = 'waiting_for_discount_report_file'
+        await query.edit_message_text(
+            "📂 <b>تفکیک لینک‌های تخفیف بر اساس مبلغ:</b>\n\n"
+            "لطفاً فایل گزارش تخفیف‌ها (فایل `.txt` مانند `Discounts_Report_...txt`) یا متن گزارش را ارسال کنید.\n\n"
+            "سیستم لینک‌ها را بر اساس مبالغ تخفیف دسته‌بندی کرده و خروجی بدون شماره تلفن تحویل می‌دهد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel")]]),
+            parse_mode='HTML'
+        )
         
     elif data == "admin_manage_users":
         await query.edit_message_text(
@@ -1660,7 +1670,7 @@ async def blocklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report_text, parse_mode='HTML')
 
 # ==========================================
-# سیستم هندل کردن ورودی متنی / فایلی / پروکسی
+# سیستم هندل کردن ورودی متنی / فایلی / پروکسی و تفکیک تخفیف
 # ==========================================
 async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1713,6 +1723,86 @@ async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAU
         except Exception as e:
             logging.error(f"Error reading proxies: {e}")
             await msg.edit_text("❌ خطا در پردازش فایل یا متن پروکسی.")
+
+    elif state == 'waiting_for_discount_report_file':
+        msg = await update.message.reply_text("⏳ در حال استخراج و تفکیک لینک‌های تخفیف...")
+        try:
+            text_content = ""
+            if update.message.document:
+                file_name = update.message.document.file_name.lower()
+                if not file_name.endswith('.txt'):
+                    await msg.edit_text("❌ فرمت فایل گزارش باید `.txt` باشد.")
+                    return
+                file = await update.message.document.get_file()
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    await file.download_to_drive(temp_file.name)
+                    with open(temp_file.name, 'r', encoding='utf-8') as f:
+                        text_content = f.read()
+            else:
+                text_content = update.message.text
+                
+            if not text_content:
+                await msg.edit_text("⚠️ محتوایی برای تفکیک یافت نشد.")
+                return
+                
+            blocks = re.split(r'─{5,}|-{5,}', text_content)
+            categories = {}
+            
+            for block in blocks:
+                normalized_block = to_english_digits(block)
+                amount_match = re.search(r'بیشترین مبلغ:\s*(?:<b>)?\s*(\d+)', normalized_block)
+                link_match = re.search(r'🔗\s*(https?://[^\s<>"]+)', normalized_block)
+                if not link_match:
+                    link_match = re.search(r'(https?://[^\s<>"]+/acc/[a-zA-Z0-9_-]+)', normalized_block)
+                
+                if amount_match and link_match:
+                    amount = int(amount_match.group(1))
+                    link = link_match.group(1).strip()
+                    if amount not in categories:
+                        categories[amount] = []
+                    if link not in categories[amount]:
+                        categories[amount].append(link)
+                        
+            if not categories:
+                await msg.edit_text("⚠️ هیچ لینک معتبری همراه با مبلغ تخفیف در این گزارش پیدا نشد.")
+                return
+                
+            sorted_amounts = sorted(categories.keys())
+            total_links = sum(len(links) for links in categories.values())
+            
+            result_text = "=== لینک‌های تفکیک شده بر اساس مبلغ تخفیف ===\n\n"
+            summary_lines = []
+            
+            for amt in sorted_amounts:
+                links = categories[amt]
+                summary_lines.append(f"• دسته <b>{amt}</b> تومنی: <b>{len(links)}</b> لینک")
+                result_text += f"دسته تخفیف {amt} تومنی\n"
+                for l in links:
+                    result_text += f"{l}\n"
+                result_text += "\n" + ("." * 20) + "\n\n"
+                
+            context.user_data['admin_state'] = None
+            ts = int(time.time())
+            
+            file_out = io.BytesIO(result_text.encode('utf-8'))
+            caption = (
+                f"✅ <b>تفکیک لینک‌ها با موفقیت انجام شد!</b>\n\n"
+                f"🔢 مجموع لینک‌های معتبر استخراج‌شده: <b>{total_links}</b>\n\n"
+                + "\n".join(summary_lines)
+            )
+            
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=file_out,
+                filename=f"Categorized_Discounts_{ts}.txt",
+                caption=caption,
+                parse_mode='HTML'
+            )
+            await msg.delete()
+            
+        except Exception as e:
+            logging.error(f"Error categorizing discount file: {e}")
+            await msg.edit_text("❌ خطایی در پردازش و تفکیک فایل رخ داد.")
 
 # ==========================================
 # توابع لاگین کاربر 
@@ -1990,3 +2080,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
