@@ -49,6 +49,16 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile"
 ]
 
+def to_english_digits(text: str) -> str:
+    """تبدیل اعداد فارسی و عربی به ارقام استاندارد انگلیسی"""
+    if not text:
+        return ""
+    persian_digits = '۰۱۲۳۴۵۶۷۸۹'
+    arabic_digits = '٠١٢٣٤٥٦٧٨٩'
+    for i in range(10):
+        text = text.replace(persian_digits[i], str(i)).replace(arabic_digits[i], str(i))
+    return text
+
 def get_anti_bot_headers():
     return {
         'accept': 'application/json, text/plain, */*',
@@ -212,7 +222,7 @@ class OkalaAPI:
         return None, None
 
 # ==========================================
-# پردازش سریع تخفیف‌ها از دیتابیس
+# پردازش سریع تخفیف‌ها از دیتابیس (اصلاح شده)
 # ==========================================
 async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     loop = asyncio.get_running_loop()
@@ -231,12 +241,14 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
             parse_mode='HTML'
         )
 
+    # استخراج لاگ‌ها برای حالت پشتیبان
     raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
     phone_to_latest_link = {}
     for item in raw_logs:
         try:
             entry = json.loads(item)
-            phone_to_latest_link[entry['phone']] = entry['link']
+            clean_p = to_english_digits(str(entry.get('phone', '')))
+            phone_to_latest_link[clean_p] = entry.get('link', '')
         except:
             pass
 
@@ -288,6 +300,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     async def _worker(key):
         nonlocal done_count, last_edit_time
         phone = key.replace("account:", "")
+        clean_phone = to_english_digits(phone)
         async with sem:
             try:
                 token_data = await redis_client.hgetall(key)
@@ -296,25 +309,32 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
 
                 if not access_token:
                     async with lock:
-                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — دسترسی موجود نیست، رد شد.\n")
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {clean_phone} — دسترسی موجود نیست، رد شد.\n")
                         done_count += 1
                     return
 
                 user_uuid = get_user_id_from_token(access_token)
                 if not user_uuid:
                     async with lock:
-                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} — شناسه کاربری قابل استخراج نیست، رد شد.\n")
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {clean_phone} — شناسه کاربری قابل استخراج نیست، رد شد.\n")
                         done_count += 1
                     return
 
                 proxy_dict = await get_random_proxy_from_db()
 
                 status, res, new_acc, new_ref, log_line = await loop.run_in_executor(
-                    executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict, phone
+                    executor, _check_sync, access_token, refresh_token, user_uuid, proxy_dict, clean_phone
                 )
 
                 if new_acc:
                     await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": new_ref or ""})
+
+                # بررسی مستقیم لینک فعال از دیتابیس با هر دو فرمت شماره
+                active_link = await redis_client.get(f"phone_active_link:{clean_phone}")
+                if not active_link:
+                    active_link = await redis_client.get(f"phone_active_link:{phone}")
+                if not active_link:
+                    active_link = phone_to_latest_link.get(clean_phone, "") or phone_to_latest_link.get(phone, "")
 
                 async with lock:
                     detail_logs.append(log_line)
@@ -323,12 +343,11 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
                         if vouchers:
                             amounts = [v.get('discountAmount', 0) for v in vouchers if v.get('discountAmount')]
                             max_amount = max(amounts) // 10000 if amounts else 0
-                            old_link = phone_to_latest_link.get(phone, "")
                             discount_results.append({
-                                "phone": phone,
+                                "phone": clean_phone,
                                 "count": len(vouchers),
                                 "max_amount": max_amount,
-                                "link": old_link
+                                "link": active_link
                             })
 
                     done_count += 1
@@ -485,10 +504,11 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename = os.path.basename(file_path)
                 try:
                     phone = filename.replace('.json', '')
+                    clean_phone = to_english_digits(phone)
                     
-                    existing_link = await redis_client.get(f"phone_active_link:{phone}")
+                    existing_link = await redis_client.get(f"phone_active_link:{clean_phone}") or await redis_client.get(f"phone_active_link:{phone}")
                     if existing_link:
-                        links_text += f"📱 <b>شماره {phone}:</b>\n⚠️ تکراری (لینک از قبل موجود است)\n\n"
+                        links_text += f"📱 <b>شماره {clean_phone}:</b>\n⚠️ تکراری (لینک از قبل موجود است)\n\n"
                         continue
 
                     with open(file_path, 'r', encoding='utf-8') as f:
@@ -504,15 +524,26 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     if item.get('name') == 'tokenMS': access_token = item.get('value')
                                     elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
                                     
-                        if access_token and not await redis_client.exists(f"account:{phone}"):
-                            await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                        if access_token and not await redis_client.exists(f"account:{clean_phone}"):
+                            await redis_client.hset(f"account:{clean_phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
                         link_id = str(uuid.uuid4())[:12]
                         await redis_client.setex(f"acc_link:{link_id}", expire_time, file_content)
                         final_url = f"{WEB_DOMAIN}/acc/{link_id}"
                         
-                        await redis_client.setex(f"phone_active_link:{phone}", expire_time, final_url)
+                        await redis_client.setex(f"phone_active_link:{clean_phone}", expire_time, final_url)
                         
-                        links_text += f"📱 <b>شماره {phone}:</b>\n{final_url}\n\n"
+                        # ثبت در تاریخچه دائمی برای نمایش همیشگی در گزارش‌ها
+                        log_entry = {
+                            "tg_id": user_id,
+                            "tg_name": "ZIP Upload",
+                            "tg_user": "admin",
+                            "phone": clean_phone,
+                            "link": final_url,
+                            "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                        await redis_client.rpush("global_link_logs", json.dumps(log_entry, ensure_ascii=False))
+                        
+                        links_text += f"📱 <b>شماره {clean_phone}:</b>\n{final_url}\n\n"
                         count += 1
                 except Exception:
                     pass
@@ -542,7 +573,8 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for item in raw_logs:
                 try:
                     entry = json.loads(item)
-                    phone_to_latest_link[entry['phone']] = entry['link']
+                    clean_p = to_english_digits(str(entry.get('phone', '')))
+                    phone_to_latest_link[clean_p] = entry.get('link', '')
                 except: pass
             
             def _check_sync_zip(acc_token, ref_token, uid, p_dict):
@@ -565,6 +597,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             access_token = None
                             refresh_token = None
                             phone = filename.replace('.json', '')
+                            clean_phone = to_english_digits(phone)
                             for cookie in data.get('cookies', []):
                                 if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
                                 if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
@@ -594,8 +627,8 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                             async with lock:
                                                 discount_count += 1
                                                 shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
-                                                old_link = phone_to_latest_link.get(phone, "لینک قدیمی در سیستم یافت نشد")
-                                                links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
+                                                old_link = await redis_client.get(f"phone_active_link:{clean_phone}") or phone_to_latest_link.get(clean_phone, "لینک در سیستم یافت نشد")
+                                                links_text += f"📱 <b>شماره {clean_phone}:</b>\n{old_link}\n\n"
                                         
                     except Exception as e:
                         async with lock:
@@ -756,7 +789,7 @@ async def ask_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     text = (
         "🔍 <b>جستجوی سریع لینک‌ها</b>\n\n"
         "لطفاً شماره موبایل کامل یا <b>۴ رقم آخر</b> آن‌ها را ارسال کنید.\n"
-        "می‌توانید در هر خط یک شماره بفرستید تا ربات همه را با هم جستجو کند.\n\n"
+        "می‌توانید در هر خط یک شماره بفرستید تا سیستم همه را همزمان جستجو کند.\n\n"
         "<b>مثال:</b>\n"
         "<code>09123456789\n5678\n09351112222</code>"
     )
@@ -764,10 +797,10 @@ async def ask_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ASK_SEARCH
 
 async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    queries = update.message.text.strip().split('\n')
-    queries = [q.strip() for q in queries if q.strip()]
+    raw_text = update.message.text.strip()
+    queries = [to_english_digits(q.strip()) for q in raw_text.split('\n') if q.strip()]
     
-    msg = await update.message.reply_text("⏳ در حال جستجو...")
+    msg = await update.message.reply_text("⏳ در حال جستجو در پایگاه داده...")
     
     raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
     phone_to_latest_link = {}
@@ -775,7 +808,8 @@ async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYP
     for item in raw_logs:
         try:
             entry = json.loads(item)
-            phone_to_latest_link[entry['phone']] = entry['link']
+            clean_p = to_english_digits(str(entry.get('phone', '')))
+            phone_to_latest_link[clean_p] = entry.get('link', '')
         except: pass
         
     report_text = "🔍 <b>نتایج جستجوی شما:</b>\n\n"
@@ -783,11 +817,23 @@ async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYP
     
     for q in queries:
         found_for_q = False
+        
+        # ۱. بررسی مستقیم لینک فعال از دیتابیس
+        direct_link = await redis_client.get(f"phone_active_link:{q}")
+        if direct_link:
+            report_text += f"✅ <code>{q}</code>\n🔗 {direct_link}\n\n"
+            found_for_q = True
+            found_count += 1
+            continue
+
+        # ۲. جستجو در تاریخچه (تطابق کامل یا حداقل ۴ رقم آخر)
         for phone, link in phone_to_latest_link.items():
             if q == phone or (len(q) >= 4 and phone.endswith(q)):
                 report_text += f"✅ <code>{phone}</code>\n🔗 {link}\n\n"
                 found_for_q = True
                 found_count += 1
+                break
+                
         if not found_for_q:
             report_text += f"❌ <code>{q}</code> ➔ یافت نشد\n\n"
             
@@ -1222,7 +1268,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user_id, text="⚠️ پایگاه داده سیستم خالی است.")
             return
         export_text = "لیست شماره‌های ثبت شده در سیستم:\n\n"
-        for key in acc_keys: export_text += f"{key.replace('account:', '')}\n"
+        for key in acc_keys: export_text += f"{to_english_digits(key.replace('account:', ''))}\n"
         
         file_out = io.BytesIO(export_text.encode('utf-8'))
         try:
@@ -1253,7 +1299,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     for item in origins[0].get("localStorage", []):
                         if item.get("name") == "user":
                             user_obj = json.loads(urllib.parse.unquote(item.get("value")))
-                            phone = user_obj.get("mobilePhone", "نامشخص")
+                            phone = to_english_digits(user_obj.get("mobilePhone", "نامشخص"))
                             break
             except Exception:
                 pass
@@ -1275,7 +1321,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=user_id, text="⏳ در حال استخراج دسترسی‌ها...")
         exported_data = {}
         for key in acc_keys:
-            phone = key.replace('account:', '')
+            phone = to_english_digits(key.replace('account:', ''))
             tokens = await redis_client.hgetall(key)
             exported_data[phone] = {
                 "access_token": tokens.get("access_token", ""),
@@ -1307,7 +1353,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     for item in origins[0].get("localStorage", []):
                         if item.get("name") == "user":
                             user_obj = json.loads(urllib.parse.unquote(item.get("value")))
-                            phone = user_obj.get("mobilePhone")
+                            phone = to_english_digits(user_obj.get("mobilePhone"))
                             break
                 if phone:
                     acc_data = await redis_client.hgetall(f"account:{phone}")
@@ -1395,7 +1441,8 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for item in raw_logs:
                 try:
                     entry = json.loads(item)
-                    log_map[entry['phone']] = entry.get('tg_name', 'نامشخص')
+                    clean_p = to_english_digits(str(entry.get('phone', '')))
+                    log_map[clean_p] = entry.get('tg_name', 'نامشخص')
                 except: pass
                 
             report_lines = []
@@ -1405,15 +1452,16 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             for key in acc_keys:
                 phone = key.replace("account:", "")
-                has_link = await redis_client.exists(f"phone_active_link:{phone}")
+                clean_phone = to_english_digits(phone)
+                has_link = await redis_client.exists(f"phone_active_link:{clean_phone}") or await redis_client.exists(f"phone_active_link:{phone}")
                 
-                if phone in log_map:
+                if clean_phone in log_map or phone in log_map:
                     user_count += 1
                 elif has_link:
-                    report_lines.append(f"📱 {phone} ➔ 🗂 اضافه شده با فایل / پشتیبان")
+                    report_lines.append(f"📱 {clean_phone} ➔ 🗂 اضافه شده با فایل / پشتیبان")
                     zip_count += 1
                 else:
-                    report_lines.append(f"📱 {phone} ➔ ⚠️ فاقد لینک (منقضی شده یا ناقص)")
+                    report_lines.append(f"📱 {clean_phone} ➔ ⚠️ فاقد لینک (منقضی شده یا ناقص)")
                     orphan_count += 1
                     
             summary = (
@@ -1458,7 +1506,8 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     link = entry.get('link', '')
                     match = re.search(r'/acc/([a-zA-Z0-9_-]+)', link)
                     if match and entry.get('tg_name') != "System Auto-Gen":
-                        phone_to_old_id[entry['phone']] = match.group(1)
+                        clean_p = to_english_digits(str(entry.get('phone', '')))
+                        phone_to_old_id[clean_p] = match.group(1)
                 except: pass
             
             generated_count = 0
@@ -1466,7 +1515,8 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             for key in acc_keys:
                 phone = key.replace("account:", "")
-                has_link = await redis_client.exists(f"phone_active_link:{phone}")
+                clean_phone = to_english_digits(phone)
+                has_link = await redis_client.exists(f"phone_active_link:{clean_phone}") or await redis_client.exists(f"phone_active_link:{phone}")
                 
                 if not has_link:
                     tokens = await redis_client.hgetall(key)
@@ -1477,29 +1527,29 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         auth_data = {
                             "access_token": acc_token, 
                             "refresh_token": ref_token,
-                            "UserInfo": {"MobilePhone": phone}
+                            "UserInfo": {"MobilePhone": clean_phone}
                         }
                         injection_json = format_for_injector(auth_data)
                         
-                        old_id = phone_to_old_id.get(phone)
+                        old_id = phone_to_old_id.get(clean_phone) or phone_to_old_id.get(phone)
                         link_id = old_id if old_id else str(uuid.uuid4())[:12]
                         final_url = f"{WEB_DOMAIN}/acc/{link_id}"
                         
                         await redis_client.setex(f"acc_link:{link_id}", expire_time, json.dumps(injection_json, ensure_ascii=False))
-                        await redis_client.setex(f"phone_active_link:{phone}", expire_time, final_url)
+                        await redis_client.setex(f"phone_active_link:{clean_phone}", expire_time, final_url)
                         
                         log_entry = {
                             "tg_id": user_id,
                             "tg_name": "System Revived" if old_id else "System Auto-Gen",
                             "tg_user": "admin",
-                            "phone": phone,
+                            "phone": clean_phone,
                             "link": final_url,
                             "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
                         }
                         await redis_client.rpush("global_link_logs", json.dumps(log_entry, ensure_ascii=False))
                         
                         status_str = "♻️ احیا شده (همان لینک قبلی)" if old_id else "🆕 لینک کاملاً جدید"
-                        links_text += f"📱 شماره: {phone}\n🔗 لینک: {final_url} ➔ {status_str}\n\n"
+                        links_text += f"📱 شماره: {clean_phone}\n🔗 لینک: {final_url} ➔ {status_str}\n\n"
                         generated_count += 1
             
             if generated_count > 0:
@@ -1713,7 +1763,7 @@ async def cancel_process_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def request_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await check_maintenance(update): return ConversationHandler.END
-    phone = update.message.text.strip()
+    phone = to_english_digits(update.message.text.strip())
     
     existing_link = await redis_client.get(f"phone_active_link:{phone}")
     if existing_link:
@@ -1768,7 +1818,7 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     return OTP 
 
 async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    otp_code = update.message.text.strip()
+    otp_code = to_english_digits(update.message.text.strip())
     phone = context.user_data.get('phone')
     msg = await update.message.reply_text("⏳ در حال پردازش درخواست...")
     
@@ -1916,8 +1966,10 @@ async def main():
         },
         fallbacks=[
             CommandHandler('cancel', cancel),
-            CallbackQueryHandler(cancel_process_callback, pattern="^cancel_action$")
-        ]
+            CallbackQueryHandler(cancel_process_callback, pattern="^cancel_action$"),
+            CallbackQueryHandler(cancel_process_callback, pattern="^main_menu$")
+        ],
+        allow_reentry=True
     )
     application.add_handler(conv_handler)
     
